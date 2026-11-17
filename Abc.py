@@ -1,6 +1,14 @@
 import re
+from io import BytesIO
+from datetime import date
 import streamlit as st
 import database
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 # ---------------- CONFIGURATION ----------------
 st.set_page_config(
     page_title="Invoice Generator",
@@ -95,6 +103,102 @@ def calculate_bill(discount_percent):
     gst = round(taxable * GST_RATE / 100, 2)
     grand_total = round(taxable + gst, 2)
     return subtotal, discount, gst, grand_total
+
+
+def generate_invoice_pdf(
+    invoice_id, order_id, invoice_date, customer_name, customer_gstin,
+    items, subtotal, discount, gst, grand_total
+):
+    """Create a downloadable PDF invoice and return its bytes."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "InvoiceTitle", parent=styles["Title"], fontSize=20,
+        textColor=colors.HexColor("#183153"), spaceAfter=8
+    )
+    story = [
+        Paragraph("TAX INVOICE", title_style),
+        Paragraph(f"<b>{RESTAURANT_NAME}</b>", styles["Heading2"]),
+        Paragraph(f"Restaurant GSTIN: {RESTAURANT_GSTIN or 'Not Provided'}", styles["Normal"]),
+        Spacer(1, 10),
+    ]
+
+    details = [
+        ["Invoice ID", str(invoice_id), "Order ID", str(order_id)],
+        ["Date", str(invoice_date), "Customer", str(customer_name)],
+        ["Customer GSTIN", str(customer_gstin or "Not Provided"), "", ""],
+    ]
+    details_table = Table(details, colWidths=[28*mm, 58*mm, 25*mm, 58*mm])
+    details_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F2F5F9")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D5DDE7")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, 1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("PADDING", (0, 0), (-1, -1), 7),
+        ("SPAN", (1, 2), (3, 2)),
+    ]))
+    story.extend([details_table, Spacer(1, 14)])
+
+    table_rows = [["Item ID", "Food Item", "Price (INR)", "Qty", "Total (INR)"]]
+    for item in items:
+        # Supports both the cart dictionary and database.get_order_items tuple.
+        if isinstance(item, dict):
+            item_id = item.get("item_id", "")
+            item_name = item.get("item_name", "")
+            price = float(item.get("price", 0))
+            quantity = int(item.get("quantity", 0))
+            total = float(item.get("total", price * quantity))
+        else:
+            item_id, item_name, price, quantity, total = item
+        table_rows.append([
+            str(item_id), str(item_name), f"{float(price):.2f}",
+            str(quantity), f"{float(total):.2f}"
+        ])
+
+    items_table = Table(
+        table_rows, repeatRows=1,
+        colWidths=[20*mm, 75*mm, 30*mm, 18*mm, 30*mm]
+    )
+    items_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#183153")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D5DDE7")),
+        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("PADDING", (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+    ]))
+    story.extend([items_table, Spacer(1, 12)])
+
+    totals = [
+        ["Subtotal", f"INR {float(subtotal):.2f}"],
+        ["Discount", f"INR {float(discount):.2f}"],
+        [f"GST ({GST_RATE}%)", f"INR {float(gst):.2f}"],
+        ["Grand Total", f"INR {float(grand_total):.2f}"],
+    ]
+    totals_table = Table(totals, colWidths=[125*mm, 48*mm], hAlign="RIGHT")
+    totals_table.setStyle(TableStyle([
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("FONTNAME", (0, 3), (-1, 3), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 3), (-1, 3), colors.HexColor("#E8EEF6")),
+        ("LINEABOVE", (0, 3), (-1, 3), 0.8, colors.HexColor("#183153")),
+        ("PADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.extend([totals_table, Spacer(1, 18), Paragraph("Thank you for your order!", styles["Italic"])])
+
+    doc.build(story)
+    return buffer.getvalue()
 # ---------------- SAVE INVOICE (button callback) ----------------
 
 def save_invoice():
@@ -374,6 +478,26 @@ if page == "Create Invoice":
             with col2:
                 st.metric("Grand Total", f"₹{grand_total:.2f}")
 
+            draft_pdf = generate_invoice_pdf(
+                invoice_id="DRAFT",
+                order_id="Not saved",
+                invoice_date=date.today().isoformat(),
+                customer_name=st.session_state.get("customer_name_input", ""),
+                customer_gstin=st.session_state.get("customer_gstin_input", ""),
+                items=list(st.session_state.cart.values()),
+                subtotal=subtotal,
+                discount=discount,
+                gst=gst,
+                grand_total=grand_total,
+            )
+            st.download_button(
+                "⬇️ Download Invoice PDF",
+                data=draft_pdf,
+                file_name="draft_invoice.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
             st.divider()
 
             col1, col2 = st.columns(2)
@@ -477,6 +601,27 @@ else:
                 ]
 
                 st.dataframe(item_data, use_container_width=True, hide_index=True)
+
+                saved_pdf = generate_invoice_pdf(
+                    invoice_id=invoice_id,
+                    order_id=order_id,
+                    invoice_date=order_date,
+                    customer_name=customer_name,
+                    customer_gstin=customer_gstin,
+                    items=invoice_items,
+                    subtotal=subtotal,
+                    discount=discount,
+                    gst=gst,
+                    grand_total=grand_total,
+                )
+                safe_invoice_name = re.sub(r"[^A-Za-z0-9_-]", "_", str(invoice_id))
+                st.download_button(
+                    "⬇️ Download Saved Invoice PDF",
+                    data=saved_pdf,
+                    file_name=f"invoice_{safe_invoice_name}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
 
                 st.divider()
 
