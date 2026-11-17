@@ -1,0 +1,4 @@
+__pycache__/
+.deepeval/
+restaurant.db
+tutorial.db
